@@ -4,8 +4,9 @@
 
 Ed's Renamer
 
-<img width="1920" height="1080" alt="Screenshot From 2026-10-04 15-48-25" src="https://github.com/user-attachments/assets/fa5760be-32a1-4135-afa3-c14e2a582938" />
 <img width="1920" height="1080" alt="Screenshot From 2026-10-04 15-48-00" src="https://github.com/user-attachments/assets/b6147e70-3274-436a-a0d3-fbbec40566ec" />
+Preview numbered filenames before applying changes.
+<img width="1920" height="1080" alt="Screenshot From 2026-10-04 15-48-25" src="https://github.com/user-attachments/assets/fa5760be-32a1-4135-afa3-c14e2a582938" />
 
 # Ed's Renamer
 
