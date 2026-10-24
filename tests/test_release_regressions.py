@@ -29,6 +29,11 @@ def test_reviewed_preview_blocks_changed_files(tmp_path, change):
         src.write_text("changed source")
     else:
         dst.write_text("new occupant")
+        if change == "destination":
+            # A filesystem's clock tick may cover both equal-length writes.
+            # Exercise the metadata contract deterministically, not clock speed.
+            assert dst.stat().st_size == reviewed[str(dst)][3]
+            os.utime(dst, ns=(dst.stat().st_atime_ns, reviewed[str(dst)][4] + 1_000_000_000))
     tx = create_transaction(tmp_path / "state")
     with pytest.raises(ValueError, match="reviewed preview"):
         execute(tx, renames, True, expected_state=reviewed)

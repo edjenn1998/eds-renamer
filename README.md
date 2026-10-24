@@ -187,7 +187,9 @@ without the identities needed to verify them.
 This is a recoverable sequence, not a filesystem-wide atomic batch. Files may be
 visible under temporary names while it runs. Fingerprints use device, inode, mode,
 size and nanosecond modification time, **not content hashes**. Avoid concurrent
-changes to the batch. A final check/syscall race remains. Locks coordinate only
+changes to the batch. Same-size content changes with unchanged recorded metadata
+(including writes within a filesystem's timestamp resolution) may not be detected.
+A final check/syscall race remains. Locks coordinate only
 the same state root, cross-filesystem moves are refused, and network durability
 depends on the server. Durable per-move journal writes can make very large batches
 slow. This app is a renamer, not a replacement for ordinary backups.

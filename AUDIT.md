@@ -29,7 +29,8 @@ self-tests for Qt previews, regex, numbering and rename/undo/redo. Release build
 also test X11 and CLI startup. Tests use disposable files, not user data.
 
 The engine remains Linux-specific and uses metadata fingerprints rather than
-content hashes. Concurrent edits and a final check/syscall race remain documented
+content hashes; same-size content changes with unchanged metadata/timestamps can
+evade those checks. Concurrent edits and a final check/syscall race remain documented
 limits. Transactions are recoverable move sequences, not filesystem-wide atomic
 batches. Durable full-journal rewrites after each move can be slow for very large
 batches; a future append-only journal/model-backed table would require a separately
