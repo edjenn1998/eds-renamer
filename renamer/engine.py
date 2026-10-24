@@ -9,12 +9,24 @@ from __future__ import annotations
 
 import os
 import random
+import re
+import stat
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Sequence, Tuple
 
 from .operations import Op, split_name
+from .native import rename_no_replace, sync_directories
+
+
+class Cancelled(Exception):
+    """An operation was cancelled at a journal-safe checkpoint."""
+
+
+def checkpoint(cancel):
+    if cancel is not None and cancel.is_set():
+        raise Cancelled("Operation cancelled. Partially applied changes were rolled back.")
 
 
 @dataclass(frozen=True)
@@ -54,11 +66,12 @@ class ValidationIssue:
 
     severity: str
     message: str
+    paths: tuple = ()
 
 
 def abspath(path: str) -> Path:
     """Absolute path WITHOUT dereferencing symlinks."""
-    return Path(os.path.abspath(str(path)))
+    return Path(os.path.abspath(os.path.expanduser(str(path))))
 
 
 def lexists(path: Path) -> bool:
@@ -69,27 +82,11 @@ def lexists(path: Path) -> bool:
 def _rename(frm: str, to: str) -> None:
     """Single indirection over os.rename (a clean monkeypatch seam for
     tests; the only place os.rename is called)."""
-    # Linux renameat2(RENAME_NOREPLACE) prevents a last-moment overwrite.
-    import ctypes
-    import errno
-    libc = ctypes.CDLL(None, use_errno=True)
-    fn = getattr(libc, "renameat2", None)
-    if fn is None:
-        raise OSError(errno.ENOSYS, "Safe no-overwrite rename requires Linux renameat2")
-    fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-    fn.restype = ctypes.c_int
-    if fn(-100, os.fsencode(frm), -100, os.fsencode(to), 1):
-        code = ctypes.get_errno()
-        raise OSError(code, os.strerror(code), to)
-    for parent in {str(Path(frm).parent), str(Path(to).parent)}:
-        fd = os.open(parent, os.O_RDONLY | os.O_DIRECTORY)
-        try:
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+    rename_no_replace(frm, to)
+    sync_directories(Path(frm).parent, Path(to).parent)
 
 
-def expand_paths(paths: Sequence[str], recursive: bool) -> List[Path]:
+def expand_paths(paths: Sequence[str], recursive: bool, cancel=None, progress=None, exclude=()) -> List[Path]:
     """Expand user-specified files/dirs into a deduplicated absolute list.
 
     A directory argument expands to its entries (recursively when
@@ -101,36 +98,61 @@ def expand_paths(paths: Sequence[str], recursive: bool) -> List[Path]:
     """
     out: List[Path] = []
     for raw in paths:
+        checkpoint(cancel)
         p = abspath(raw)
         if os.path.isdir(str(p)) and not os.path.islink(str(p)):
-            out.extend(entry_files(p, recursive))
+            out.extend(entry_files(p, recursive, cancel, progress, exclude))
         else:
             out.append(p)
     seen = set()
     unique: List[Path] = []
     for p in sorted(out, key=lambda x: str(x)):
+        checkpoint(cancel)
         if str(p) not in seen:
             seen.add(str(p))
             unique.append(p)
     return unique
 
 
-def entry_files(directory: Path, recursive: bool) -> List[Path]:
+def entry_files(directory: Path, recursive: bool, cancel=None, progress=None, exclude=()) -> List[Path]:
     """Files/symlinks inside ``directory`` using a non-following walk."""
     results: List[Path] = []
     stack = [directory]
+    excluded = [Path(p).resolve() for p in exclude]
+    visited = set()
     while stack:
+        checkpoint(cancel)
         current = stack.pop()
-        with os.scandir(str(current)) as it:
-            for entry in it:
-                if entry.name.startswith(".renamer-"):
-                    continue  # preserve journal-managed backups and temporary entries
-                p = abspath(entry.path)
-                if entry.is_dir(follow_symlinks=False):
-                    if recursive:
-                        stack.append(p)
-                else:
-                    results.append(p)
+        if any(current.resolve().is_relative_to(p) for p in excluded):
+            continue
+        st = os.lstat(current)
+        if stat.S_ISLNK(st.st_mode):
+            results.append(current)
+            continue
+        key = (st.st_dev, st.st_ino)
+        if key in visited:
+            continue
+        visited.add(key)
+        fd = os.open(current, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) != key:
+                raise ValueError(f"Directory changed during discovery: {current}")
+            with os.scandir(fd) as it:
+                for entry in it:
+                    checkpoint(cancel)
+                    if entry.name.startswith(".renamer-"):
+                        continue
+                    p = abspath(current / entry.name)
+                    if entry.is_dir(follow_symlinks=False):
+                        if recursive:
+                            stack.append(p)
+                    elif entry.is_file(follow_symlinks=False) or entry.is_symlink():
+                        results.append(p)
+                    if progress:
+                        progress(len(results), 0, "Discovering files")
+        finally:
+            os.close(fd)
     return sorted(results, key=lambda x: str(x))
 
 
@@ -139,6 +161,10 @@ def order_paths(paths: List[Path], mode: str) -> List[Path]:
     ``mtime``/``size`` use lstat so symlinks are not followed."""
     if mode == "name":
         return sorted(paths, key=lambda p: (str(p.parent), p.name))
+    if mode == "natural":
+        return sorted(paths, key=lambda p: (str(p.parent),
+                      [int(part) if part.isdecimal() else part.casefold()
+                       for part in re.split(r"(\d+)", p.name)], p.name))
     if mode == "mtime":
         return sorted(paths, key=lambda p: (os.lstat(str(p)).st_mtime, str(p)))
     if mode == "size":
@@ -158,7 +184,7 @@ def _is_valid_name(name: str) -> bool:
 
 
 def plan(
-    paths: Sequence[Path], ops: Sequence[Op]
+    paths: Sequence[Path], ops: Sequence[Op], cancel=None, progress=None
 ) -> Tuple[List[Rename], List[ValidationIssue]]:
     """Apply every operation to every path's name; drop unchanged entries.
 
@@ -169,23 +195,26 @@ def plan(
     planned: List[Rename] = []
     issues: List[ValidationIssue] = []
     for index, path in enumerate(paths):
+        checkpoint(cancel)
         stem, suffix = split_name(path.name)
         for op in ops:
             stem, suffix = op(stem, suffix, index, total)
         new_name = stem + suffix
         if not _is_valid_name(new_name):
             issues.append(
-                ValidationIssue("error", f"invalid generated name {new_name!r} for {path}")
+                ValidationIssue("error", f"invalid generated name {new_name!r} for {path}", (str(path),))
             )
             continue
         dest = path.parent / new_name
         if str(dest) == str(path):
             continue
         planned.append(Rename(path, dest))
+        if progress:
+            progress(index + 1, total, "Planning names")
     return planned, issues
 
 
-def validate(renames: Sequence[Rename], force: bool = False) -> List[ValidationIssue]:
+def validate(renames: Sequence[Rename], force: bool = False, cancel=None) -> List[ValidationIssue]:
     """Validate a whole planned batch (pure: only reads the filesystem).
 
     Errors — the batch must not be applied, and ``force`` never bypasses
@@ -202,68 +231,60 @@ def validate(renames: Sequence[Rename], force: bool = False) -> List[ValidationI
     is destroyed and undo restores both files.
     """
     issues: List[ValidationIssue] = []
-    sources, destinations = set(), set()
+    keys = []
     for r in renames:
-        src_key = str(r.src.parent.resolve() / r.src.name)
-        dst_key = str(r.dst.parent.resolve() / r.dst.name)
-        if src_key in sources or dst_key in destinations:
-            issues.append(ValidationIssue("error", "Duplicate or aliased source/destination path"))
-        sources.add(src_key)
-        destinations.add(dst_key)
+        checkpoint(cancel)
+        keys.append((canonical(r.src), canonical(r.dst)))
+    sources = {key[0] for key in keys}
+    seen_sources, destinations, limits = set(), {}, {}
+    for r, (src_key, dst_key) in zip(renames, keys):
+        checkpoint(cancel)
+        paths = (str(r.src), str(r.dst))
+        def issue(message, severity="error", related=paths):
+            issues.append(ValidationIssue(severity, message, related))
+        if src_key in seen_sources:
+            issue(f"duplicate source or aliased path: {r.src}")
+        seen_sources.add(src_key)
+        if dst_key in destinations:
+            previous = destinations[dst_key]
+            issue(f"duplicate destination {r.dst}: both {previous} and {r.src} point at it (force cannot bypass this)",
+                  related=paths + (previous,))
+        destinations[dst_key] = str(r.src)
         if src_key == dst_key:
-            issues.append(ValidationIssue("error", "Source and destination are identical"))
+            issue("Source and destination are identical")
         if r.src.name.startswith(".renamer-"):
-            issues.append(ValidationIssue("error", "Journal-managed temporary/backup entries cannot be selected"))
-        if r.src.is_dir() and not r.src.is_symlink():
-            issues.append(ValidationIssue("error", "Directory renaming is not supported"))
-    for r in renames:
-        if not _is_valid_name(r.dst.name):
-            issues.append(
-                ValidationIssue("error", f"invalid destination name: {r.dst}")
-            )
-    seen_src = set()
-    for r in renames:
-        if str(r.src) in seen_src:
-            issues.append(ValidationIssue("error", f"duplicate source: {r.src}"))
-        seen_src.add(str(r.src))
-    for r in renames:
+            issue("Journal-managed temporary/backup entries cannot be selected")
         if not lexists(r.src):
-            issues.append(ValidationIssue("error", f"source does not exist: {r.src}"))
-        if not os.path.isdir(str(r.dst.parent)):
-            issues.append(
-                ValidationIssue("error", f"destination parent missing: {r.dst.parent}")
-            )
-    dst_seen = {}
-    for r in renames:
-        key = str(r.dst)
-        if key in dst_seen:
-            issues.append(
-                ValidationIssue(
-                    "error",
-                    f"duplicate destination {key}: both {dst_seen[key]} and"
-                    f" {r.src} point at it (force cannot bypass this)",
-                )
-            )
+            issue(f"source does not exist: {r.src}")
         else:
-            dst_seen[key] = str(r.src)
-    for r in renames:
-        if lexists(r.dst) and str(r.dst) not in {str(x.src) for x in renames}:
-            if force:
-                issues.append(
-                    ValidationIssue(
-                        "warning",
-                        f"destination {r.dst} (from {r.src}) will be overwritten;"
-                        " occupant content preserved in backup",
-                    )
-                )
-            else:
-                issues.append(
-                    ValidationIssue(
-                        "error",
-                        f"destination already exists: {r.dst} (from {r.src})"
-                        " (use --force for a safe, undoable overwrite)",
-                    )
-                )
+            mode = os.lstat(r.src).st_mode
+            if stat.S_ISDIR(mode):
+                issue("Directory renaming is not supported")
+            elif not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+                issue(f"Only regular files and symlinks can be renamed: {r.src}")
+        if not _is_valid_name(r.dst.name):
+            issue(f"invalid destination name: {r.dst}")
+            continue
+        if not r.dst.parent.is_dir():
+            issue(f"destination parent missing: {r.dst.parent}")
+            continue
+        parent = str(r.dst.parent)
+        if parent not in limits:
+            limits[parent] = os.pathconf(parent, "PC_NAME_MAX")
+        if limits[parent] > 0 and len(os.fsencode(r.dst.name)) > limits[parent]:
+            issue(f"Filename exceeds {limits[parent]} bytes: {r.dst.name}")
+            continue
+        if lexists(r.dst):
+            mode = os.lstat(r.dst).st_mode
+            if stat.S_ISDIR(mode):
+                issue(f"Cannot overwrite a directory: {r.dst}")
+            elif not (stat.S_ISREG(mode) or stat.S_ISLNK(mode)):
+                issue(f"Cannot overwrite a special file: {r.dst}")
+            elif dst_key not in sources:
+                if force:
+                    issue(f"destination {r.dst} (from {r.src}) will be overwritten; occupant content preserved in backup", "warning")
+                else:
+                    issue(f"destination already exists: {r.dst} (from {r.src}) (use --force for a safe, undoable overwrite)")
     return issues
 
 
@@ -277,8 +298,19 @@ def summary(issues: Sequence[ValidationIssue]) -> str:
 
 def occupied_destinations(renames: Sequence[Rename]) -> List[Rename]:
     """Renames whose destination exists but is not itself a batch source."""
-    sources = {str(r.src) for r in renames}
-    return [r for r in renames if lexists(r.dst) and str(r.dst) not in sources]
+    sources = {canonical(r.src) for r in renames}
+    return [r for r in renames if lexists(r.dst) and canonical(r.dst) not in sources]
+
+
+def canonical(path):
+    path = Path(path)
+    return str(path.parent.resolve() / path.name)
+
+
+def snapshot(renames):
+    """Capture the sources and destination occupants shown by a preview."""
+    return {str(p): fingerprint(p) if lexists(p) else None
+            for r in renames for p in (r.src, r.dst)}
 
 
 def fingerprint(path):
@@ -286,17 +318,21 @@ def fingerprint(path):
     return [st.st_dev, st.st_ino, st.st_mode, st.st_size, st.st_mtime_ns]
 
 
-def execute(tx, renames: Sequence[Rename], force: bool = False) -> None:
+def execute(tx, renames: Sequence[Rename], force: bool = False, expected_state=None, cancel=None, progress=None) -> None:
     from .session import transaction_lock, check_pending
     with transaction_lock(tx.root):
         check_pending(tx.root, exclude=tx.id)
         if tx.moves or tx.status != "planned":
             raise ValueError("Use a fresh transaction for each batch")
         renames = [Rename(abspath(r.src), abspath(r.dst)) for r in renames]
+        checkpoint(cancel)
+        reviewed = snapshot(renames) if expected_state is None else expected_state
+        if snapshot(renames) != reviewed:
+            raise ValueError("Files changed since the reviewed preview. Refresh preview before applying.")
         state_root = Path(tx.root).resolve()
         if any(p.parent.resolve().is_relative_to(state_root) for r in renames for p in (r.src, r.dst)):
             raise ValueError("The transaction storage directory cannot be renamed")
-        issues = validate(renames, force)
+        issues = validate(renames, force, cancel)
         if has_errors(issues):
             if occupied_destinations(renames) and not force:
                 raise FileExistsError(summary(issues))
@@ -309,22 +345,33 @@ def execute(tx, renames: Sequence[Rename], force: bool = False) -> None:
             temp = _unique_sibling(r.src, "tmp")
             moves.append(Move(str(r.src), str(temp)))
             final.append(Move(str(temp), str(r.dst)))
-        _run(tx, moves + final)
+        state = {canonical(path): identity for path, identity in reviewed.items()}
+        expected = []
+        for move in moves + final:
+            source, destination = canonical(move.frm), canonical(move.to)
+            identity = state.get(source)
+            if identity is None or state.get(destination) is not None:
+                raise ValueError("Files changed since the reviewed preview. Refresh preview before applying.")
+            expected.append(identity)
+            state[destination], state[source] = identity, None
+        _run(tx, moves + final, expected=expected, cancel=cancel, progress=progress)
 
 
 def inverse_moves(moves: Sequence[Move]) -> List[Move]:
     return [Move(m.to, m.frm) for m in reversed(list(moves))]
 
 
-def preflight(moves, expected=None):
+def preflight(moves, expected=None, cancel=None):
     """Simulate the entire sequence, including occupied temporary names."""
     state = {}
     def get(path):
-        if path not in state:
-            state[path] = fingerprint(path) if lexists(Path(path)) else None
-        return state[path]
+        key = canonical(path)
+        if key not in state:
+            state[key] = fingerprint(path) if lexists(Path(path)) else None
+        return state[key]
     records = []
     for i, m in enumerate(moves):
+        checkpoint(cancel)
         identity = get(m.frm)
         if identity is None:
             raise FileNotFoundError(m.frm)
@@ -335,21 +382,23 @@ def preflight(moves, expected=None):
         if not Path(m.to).parent.is_dir():
             raise FileNotFoundError(str(Path(m.to).parent))
         records.append(identity)
-        state[m.to], state[m.frm] = identity, None
+        state[canonical(m.to)], state[canonical(m.frm)] = identity, None
     return records
 
 
-def apply_moves(tx, moves: Sequence[Move], expected=None) -> None:
-    _run(tx, list(moves), expected)
+def apply_moves(tx, moves: Sequence[Move], expected=None, cancel=None, progress=None) -> None:
+    _run(tx, list(moves), expected, cancel, progress)
 
 
-def _run(tx, moves, expected=None):
-    tx.identities = preflight(moves, expected)
+def _run(tx, moves, expected=None, cancel=None, progress=None):
+    checkpoint(cancel)
+    tx.identities = preflight(moves, expected, cancel)
     tx.planned_moves = list(moves)
     tx.status = "phase1"
     tx.save()  # complete write-ahead plan, before ANY filesystem move
     try:
         for i, m in enumerate(moves):
+            checkpoint(cancel)
             if fingerprint(m.frm) != tx.identities[i]:
                 raise ValueError(f"Source changed: {m.frm}")
             tx.pending = {"from": m.frm, "to": m.to, "identity": tx.identities[i]}
@@ -358,12 +407,15 @@ def _run(tx, moves, expected=None):
             tx.moves.append(m)
             tx.pending = None
             tx.save()
+            if progress:
+                progress(i + 1, len(moves), "Renaming files")
+        checkpoint(cancel)
         tx.status = "completed"
         tx.save()
     except Exception as exc:
         tx.status = "failed"
         try:
-            recover_transaction(tx)
+            recover_transaction(tx, progress=progress)
         except Exception as rollback_error:
             raise RuntimeError(f"Transaction interrupted; recovery needed for {tx.id}: {rollback_error}") from exc
         raise
@@ -389,15 +441,18 @@ def _settle_pending(tx):
     tx.save()
 
 
-def recover_transaction(tx):
+def recover_transaction(tx, cancel=None, progress=None):
     """Restore the original state; stop rather than overwrite changed files."""
     if tx.status in ("completed", "rolled_back"):
         raise ValueError(f"Session {tx.id} does not need recovery")
     _settle_pending(tx)
     tx.status = "recovering"
     tx.save()
+    total = len(tx.moves)
     try:
         while tx.moves:
+            if cancel is not None and cancel.is_set():
+                raise Cancelled("Recovery paused. Resume it from History / recovery.")
             m = tx.moves[-1]
             identity = tx.identities[len(tx.moves)-1]
             if fingerprint(m.to) != identity:
@@ -408,6 +463,8 @@ def recover_transaction(tx):
             tx.moves.pop()
             tx.pending = None
             tx.save()
+            if progress:
+                progress(total - len(tx.moves), total, "Restoring original names")
         tx.status = "rolled_back"
         tx.save()
     except Exception:

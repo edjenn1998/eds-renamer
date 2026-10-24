@@ -1,4 +1,25 @@
-# Desktop edition changes
+# Ed's Renamer 1.1.0
+
+- Add a tested x86_64 AppImage, static runtime/no-FUSE fallback, checksums, native
+  ABI/dependency audits, current license notices and Ubuntu 22.04 CI builds.
+- Bind Apply to reviewed source/destination identities through execution; block
+  directory/special-file overwrites, long names and changed preview state.
+- Fix canonical alias handling and non-following directory discovery; exclude the
+  journal root and reduce repeated validation/conflict-rendering work.
+- Add progress, cooperative cancellation/rollback, recovery pause/resume, finished
+  preview-worker cleanup and safe deferred closing.
+- Keep damaged history accessible but block new mutations; validate journal IDs
+  and schema, exclusively create private journals and clean failed save temps.
+- Add a read-only journal viewer, explicit redo button and reversal metadata while
+  retaining version-2/legacy readability and the existing ~/.renamer location.
+- Bound regex matching time and provide readable CLI pattern/interrupt errors.
+- Add natural ordering, preview CSV export, validated settings-only presets and
+  Reset changes. Preserve the approved icon and numbering defaults.
+- Fix AppImage menu shortcuts, XDG data paths and reserved-character quoting.
+- Refresh the screenshot and provide novice-friendly AppImage launch instructions.
+- 145 regression tests plus packaged GUI/CLI self-tests.
+
+# Historical desktop edition changes
 
 - engine.py: enforce validation in execute; detect aliased duplicate paths;
   protect journal storage; prohibit direct directory renaming; implement Linux

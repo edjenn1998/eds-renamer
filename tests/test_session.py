@@ -69,9 +69,3 @@ def test_journal_written_before_changes(tmp_path):
     finally:
         eng._rename = real
     assert created["seen"] == [str((tmp_path / "home" / "sessions" / "s.json"))]
-
-
-def abspath_tmp(p):
-    import os
-
-    return type(p)(os.path.abspath(str(p)))

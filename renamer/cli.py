@@ -21,6 +21,7 @@ from .engine import (
     has_errors,
     order_paths,
     plan,
+    snapshot,
     validate,
 )
 from .session import (
@@ -29,7 +30,9 @@ from .session import (
     list_session_ids,
     load_transaction,
     newest_session,
+    inspect_sessions,
 )
+from .version import VERSION
 
 
 def add_operation_args(parser: argparse.ArgumentParser) -> None:
@@ -119,12 +122,13 @@ def make_ops(args: argparse.Namespace) -> List[ops.Op]:
 
 
 def cmd_rename(args: argparse.Namespace) -> int:
-    paths = expand_paths(args.paths, args.recursive)
+    paths = expand_paths(args.paths, args.recursive, exclude=[Path(args.home).expanduser()])
     if not paths:
         print("no files matched", file=sys.stderr)
         return 1
     ordered = order_paths(paths, args.order)
     renames, issues = plan(ordered, make_ops(args))
+    expected_state = snapshot(renames)
     issues = issues + validate(renames, force=args.force)
     if has_errors(issues):
         print("cannot apply:", file=sys.stderr)
@@ -143,7 +147,7 @@ def cmd_rename(args: argparse.Namespace) -> int:
         print(f"\n[dry run] {len(renames)} file(s); re-run with --apply")
         return 0
     tx = create_transaction(Path(args.home))
-    execute(tx, renames, force=args.force)
+    execute(tx, renames, force=args.force, expected_state=expected_state)
     print(
         f"renamed {len(renames)} file(s); session {tx.id}"
         f" (undo with: undo --session {tx.id})"
@@ -175,9 +179,11 @@ def cmd_sessions(args: argparse.Namespace) -> int:
     if not ids:
         print("no saved sessions")
         return 0
-    for sid in ids:
-        print(f"{sid}  {load_transaction(Path(args.home), sid).status}")
-    return 0
+    damaged = False
+    for sid, status, _, action, error in inspect_sessions(Path(args.home)):
+        print(f"{sid}  {status}  {action}" + (f"  {error}" if error else ""))
+        damaged = damaged or bool(error)
+    return 2 if damaged else 0
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -185,6 +191,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog="rename",
         description="bulk file renamer (dry-run by default)",
     )
+    parser.add_argument("--version", action="version", version=f"Ed's Renamer {VERSION}")
     parser.add_argument(
         "--home",
         default=str(DEFAULT_ROOT),
@@ -208,7 +215,7 @@ def build_parser() -> argparse.ArgumentParser:
     add_operation_args(rename_p)
     rename_p.add_argument("--recursive", action="store_true", help="recurse into dirs")
     rename_p.add_argument(
-        "--order", choices=("name", "mtime", "size", "random"), default="name"
+        "--order", choices=("name", "natural", "mtime", "size", "random"), default="name"
     )
     rename_p.add_argument(
         "--apply",
@@ -245,6 +252,9 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.func(args)
+    except KeyboardInterrupt:
+        print("Interrupted. Use sessions and recover --session SESSION_ID if a batch was started.", file=sys.stderr)
+        return 130
     except (OSError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

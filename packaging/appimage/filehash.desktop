@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Ed's Renamer
+Comment=Bulk rename files with live previews, undo and recovery
+Exec=AppRun
+Icon=filehash
+Terminal=false
+Categories=Utility;FileTools;Qt;
+StartupWMClass=filehash

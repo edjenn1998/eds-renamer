@@ -12,7 +12,6 @@ from renamer.engine import (
     expand_paths,
     has_errors,
     inverse_moves,
-    lexists,
     order_paths,
     plan,
     validate,
@@ -386,4 +385,3 @@ def test_rename_undo_redo_sequence(tmp_path):
     tx3 = tx2.undo()  # undo the undo -> redo
     assert state(tmp_path) == after_rename
     assert tx1.status == tx2.status == tx3.status == "completed"
-

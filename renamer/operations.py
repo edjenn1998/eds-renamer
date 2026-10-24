@@ -48,10 +48,21 @@ def replace_op(old: str, new: str) -> Op:
 
 
 def regex_op(pattern: str, repl: str, ignore_case: bool = False) -> Op:
-    rx = re.compile(pattern, re.IGNORECASE if ignore_case else 0)
+    import regex
+    if len(pattern) > 4096 or len(repl) > 4096:
+        raise ValueError("Patterns and replacements are limited to 4096 characters")
+    try:
+        rx = regex.compile(pattern, regex.VERSION0 | (regex.IGNORECASE if ignore_case else 0))
+    except regex.error as exc:
+        raise ValueError(f"Invalid pattern: {exc}") from exc
 
     def op(stem: str, suffix: str, index: int, total: int) -> Tuple[str, str]:
-        return rx.sub(repl, stem), suffix
+        try:
+            return rx.sub(repl, stem, timeout=0.05, concurrent=True), suffix
+        except TimeoutError as exc:
+            raise ValueError("Pattern took too long; simplify it or use ordinary Find") from exc
+        except regex.error as exc:
+            raise ValueError(f"Invalid replacement: {exc}") from exc
 
     return op
 
@@ -106,6 +117,8 @@ def numbering_op(
     """
     if mode not in ("token", "prefix", "suffix"):
         raise ValueError(f"unknown number mode: {mode!r}")
+    if not 1 <= pad <= 255:
+        raise ValueError("number padding must be between 1 and 255")
 
     def op(stem: str, suffix: str, index: int, total: int) -> Tuple[str, str]:
         value = start + step * index

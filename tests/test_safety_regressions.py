@@ -1,7 +1,6 @@
-import os
 from pathlib import Path
 import pytest
-from renamer.engine import Rename, execute, fingerprint
+from renamer.engine import Rename, execute
 from renamer.session import create_transaction, load_transaction, newest_session
 import renamer.engine as engine
 

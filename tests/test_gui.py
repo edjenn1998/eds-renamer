@@ -1,6 +1,5 @@
 import os
 os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
-from pathlib import Path
 import pytest
 pytest.importorskip('PySide6')
 from PySide6.QtWidgets import QApplication, QMessageBox
@@ -13,10 +12,10 @@ def app():
 def finish(app,window):
     import time
     deadline=time.monotonic()+10
-    while window.worker and window.worker.isRunning():
+    while window.worker:
         app.processEvents()
         if time.monotonic()>deadline:raise AssertionError('Worker timed out')
-        window.worker.wait(10)
+        if window.worker: window.worker.wait(10)
     app.processEvents()
 
 
